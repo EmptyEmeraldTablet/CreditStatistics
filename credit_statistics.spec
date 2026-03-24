@@ -1,27 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 PyInstaller spec for 哈工程学分统计系统.
-Bundles ddddocr ONNX models and onnxruntime DLLs into a single executable.
+No OCR runtime dependencies are bundled.
 """
-import os
-import sys
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
-
-# ddddocr 需要 ONNX 模型文件
-ddddocr_datas = collect_data_files("ddddocr", include_py_files=False)
-# onnxruntime 需要动态库
-ort_binaries = collect_dynamic_libs("onnxruntime")
 
 a = Analysis(
     ["credit_statistics.py"],
     pathex=[],
-    binaries=ort_binaries,
-    datas=ddddocr_datas,
+    binaries=[],
+    datas=[],
     hiddenimports=[
-        "ddddocr",
-        "onnxruntime",
-        "PIL",
-        "numpy",
         "requests",
         "urllib3",
         "certifi",

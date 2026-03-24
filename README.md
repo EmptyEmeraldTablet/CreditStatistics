@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **CAS SSO 自动登录** — 自动识别验证码，无需手动操作
+- **CAS SSO 登录** — 登录界面展示验证码图片，支持手动输入与刷新
 - **学分统计** — 必修 / 专选 / 公选（按类别细分）
 - **毕业要求检查** — 实时判断各项要求是否达标
 - **毕业预测** — 模拟本学期课程全部通过后能否满足毕业要求
@@ -63,7 +63,6 @@ git push origin v1.0.0
 ## 技术栈
 
 - Python 3.13 + tkinter（GUI）
-- ddddocr（验证码 OCR）
 - requests（HTTP 会话）
 - PyInstaller（打包）
 - GitHub Actions（CI 构建）

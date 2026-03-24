@@ -6,15 +6,12 @@
 
 import re
 import sys
-import time
-import base64
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import ddddocr
 from collections import defaultdict
 
 # 高DPI适配（必须在创建Tk之前调用）
@@ -33,7 +30,6 @@ if sys.platform == "win32":
 # ============ 网络配置 ============
 CAS_BASE = "https://cas-443.wvpn.hrbeu.edu.cn"
 JWGL_BASE = "https://jwgl-443.wvpn.hrbeu.edu.cn"
-MAX_CAPTCHA_RETRIES = 30
 
 
 # ============ 毕业要求配置 ============
@@ -96,23 +92,27 @@ def create_session():
     return session
 
 
-def cas_login(session, username, password, on_status=None):
-    """CAS SSO登录，on_status(msg) 回调状态更新"""
+def prepare_cas_login(session, on_status=None):
+    """准备CAS登录上下文（lt/execution等隐藏字段）"""
 
     def status(msg):
         if on_status:
             on_status(msg)
 
     portal_url = f"{JWGL_BASE}/jwapp/sys/emaphome/portal/index.do"
-    ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-
     status("正在连接教务系统...")
     resp = session.get(portal_url, allow_redirects=True, timeout=15)
     cas_login_url = resp.url
 
     if "cas/login" not in cas_login_url:
         status("已通过会话登录")
-        return True
+        return {
+            "portal_url": portal_url,
+            "cas_login_url": cas_login_url,
+            "lt": "",
+            "execution": "e1s1",
+            "need_login": False,
+        }
 
     lt = ""
     execution = "e1s1"
@@ -123,69 +123,79 @@ def cas_login(session, username, password, on_status=None):
     if m_exec:
         execution = m_exec.group(1)
 
-    for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
-        status(f"识别验证码... (第{attempt}次)")
+    return {
+        "portal_url": portal_url,
+        "cas_login_url": cas_login_url,
+        "lt": lt,
+        "execution": execution,
+        "need_login": True,
+    }
 
-        captcha_resp = session.get(
-            f"{CAS_BASE}/sso/apis/v2/open/captcha?imageWidth=100&captchaSize=4",
-            timeout=15,
-        )
-        captcha_data = captcha_resp.json()
-        captcha_token = captcha_data["token"]
-        captcha_b64 = captcha_data["img"].replace("\n", "")
-        captcha_bytes = base64.b64decode(captcha_b64)
-        captcha_text = re.sub(
-            r"[^a-z0-9]", "", ocr.classification(captcha_bytes).lower().strip()
-        )
 
-        if len(captcha_text) != 4:
-            continue
+def fetch_captcha(session):
+    """获取验证码 token 与 base64 图片数据"""
+    resp = session.get(
+        f"{CAS_BASE}/sso/apis/v2/open/captcha?imageWidth=100&captchaSize=4",
+        timeout=15,
+    )
+    data = resp.json()
+    return data["token"], data["img"].replace("\n", "")
 
-        resp = session.post(
-            cas_login_url,
-            data={
-                "username": username,
-                "password": password,
-                "captcha": captcha_text,
-                "token": captcha_token,
-                "lt": lt,
-                "execution": execution,
-                "_eventId": "submit",
-                "source": "cas",
-            },
-            allow_redirects=True,
-            timeout=15,
-        )
 
-        if "cas/login" not in resp.url:
-            status("登录成功，正在加载数据...")
-            session.get(portal_url, allow_redirects=True, timeout=15)
-            return True
+def cas_login(
+    session,
+    username,
+    password,
+    captcha_text,
+    captcha_token,
+    login_context,
+    on_status=None,
+):
+    """CAS SSO登录，验证码由用户手动输入"""
 
-        m = re.search(r'name="lt"\s+value="([^"]+)"', resp.text)
-        if m:
-            lt = m.group(1)
-        m_exec = re.search(r'name="execution"\s+value="([^"]+)"', resp.text)
-        if m_exec:
-            execution = m_exec.group(1)
+    def status(msg):
+        if on_status:
+            on_status(msg)
 
-        if "未能够识别出目标" in resp.text or "TicketNotFound" in resp.text:
-            resp2 = session.get(cas_login_url, timeout=15)
-            m2 = re.search(r'name="lt"\s+value="([^"]+)"', resp2.text)
-            if m2:
-                lt = m2.group(1)
-            m2_exec = re.search(r'name="execution"\s+value="([^"]+)"', resp2.text)
-            if m2_exec:
-                execution = m2_exec.group(1)
-            continue
+    if not login_context:
+        raise RuntimeError("登录上下文失效，请刷新验证码后重试")
 
-        ec = re.search(r'id="errorcode"[^>]*value="([^"]*)"', resp.text)
-        if ec and ec.group(1) == "INVALID_CREDENTIAL":
-            raise ValueError("用户名或密码错误")
+    if not login_context.get("need_login", True):
+        return True
 
-        time.sleep(0.5)
+    if not captcha_text:
+        raise ValueError("请输入验证码")
 
-    raise TimeoutError("验证码识别多次失败，请稍后重试")
+    status("正在提交登录信息...")
+    resp = session.post(
+        login_context["cas_login_url"],
+        data={
+            "username": username,
+            "password": password,
+            "captcha": captcha_text,
+            "token": captcha_token,
+            "lt": login_context["lt"],
+            "execution": login_context["execution"],
+            "_eventId": "submit",
+            "source": "cas",
+        },
+        allow_redirects=True,
+        timeout=15,
+    )
+
+    if "cas/login" not in resp.url:
+        status("登录成功，正在加载数据...")
+        session.get(login_context["portal_url"], allow_redirects=True, timeout=15)
+        return True
+
+    ec = re.search(r'id="errorcode"[^>]*value="([^"]*)"', resp.text)
+    if ec and ec.group(1) == "INVALID_CREDENTIAL":
+        raise ValueError("用户名或密码错误")
+
+    if "验证码" in resp.text or "未能够识别出目标" in resp.text or "TicketNotFound" in resp.text:
+        raise ValueError("验证码错误或已过期，请点击“刷新验证码”后重试")
+
+    raise RuntimeError("登录失败，请检查网络连接后重试")
 
 
 def init_app(session, app_name):
@@ -377,7 +387,7 @@ class CreditStatsApp:
         root.tk.call("tk", "scaling", self.scale * 1.333333)
 
         # 登录窗口尺寸（按缩放调整）
-        w, h = int(520 * self.scale), int(400 * self.scale)
+        w, h = int(520 * self.scale), int(460 * self.scale)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
         root.resizable(False, False)
@@ -408,6 +418,11 @@ class CreditStatsApp:
     # -------------------- 登录界面 --------------------
     def _build_login(self):
         f = self.font_family
+        self.session = None
+        self.login_context = None
+        self.captcha_token = ""
+        self.captcha_photo = None
+
         self.login_frame = ttk.Frame(self.root, padding=30)
         self.login_frame.pack(expand=True, fill="both")
 
@@ -438,10 +453,30 @@ class CreditStatsApp:
         )
         self.pass_entry.grid(row=1, column=1, pady=8)
 
+        ttk.Label(form, text="验证码：", font=(f, 11)).grid(
+            row=2, column=0, padx=(0, 6), pady=8, sticky="e"
+        )
+        captcha_row = ttk.Frame(form)
+        captcha_row.grid(row=2, column=1, pady=8, sticky="w")
+
+        self.captcha_var = tk.StringVar()
+        self.captcha_entry = ttk.Entry(
+            captcha_row, textvariable=self.captcha_var, width=10, font=(f, 11)
+        )
+        self.captcha_entry.pack(side="left")
+
+        self.refresh_btn = ttk.Button(
+            captcha_row, text="刷新验证码", command=self._refresh_captcha, width=10
+        )
+        self.refresh_btn.pack(side="left", padx=(8, 0))
+
+        self.captcha_image_label = ttk.Label(form)
+        self.captcha_image_label.grid(row=3, column=1, pady=(2, 4), sticky="w")
+
         self.login_btn = ttk.Button(
             center, text="登录查询", command=self._on_login, width=18
         )
-        self.login_btn.pack(pady=22)
+        self.login_btn.pack(pady=16)
 
         self.status_var = tk.StringVar()
         self.status_label = ttk.Label(
@@ -452,43 +487,99 @@ class CreditStatsApp:
         # 快捷键
         self.user_entry.bind("<Return>", lambda _: self.pass_entry.focus())
         self.pass_entry.bind("<Return>", lambda _: self._on_login())
+        self.captcha_entry.bind("<Return>", lambda _: self._on_login())
         self.user_entry.focus()
+        self._refresh_captcha()
+
+    def _refresh_captcha(self):
+        self.refresh_btn.config(state="disabled")
+        self._set_status("正在获取验证码...")
+        threading.Thread(target=self._captcha_worker, daemon=True).start()
+
+    def _captcha_worker(self):
+        try:
+            if self.session is None:
+                self.session = create_session()
+            self.login_context = prepare_cas_login(self.session, on_status=self._set_status)
+            if not self.login_context.get("need_login", True):
+                self.root.after(0, lambda: self._update_captcha_ui("", ""))
+                self._set_status("检测到已有登录会话，可直接登录")
+                return
+
+            token, image_b64 = fetch_captcha(self.session)
+            self.root.after(0, lambda: self._update_captcha_ui(token, image_b64))
+            self._set_status("验证码已加载，请输入后登录")
+        except Exception as e:
+            self._set_status(f"获取验证码失败: {e}")
+            self.root.after(0, lambda: self.refresh_btn.config(state="normal"))
+
+    def _update_captcha_ui(self, token, image_b64):
+        self.captcha_token = token
+        self.captcha_var.set("")
+        if image_b64:
+            self.captcha_photo = tk.PhotoImage(data=image_b64)
+            self.captcha_image_label.config(image=self.captcha_photo, text="")
+        else:
+            self.captcha_photo = None
+            self.captcha_image_label.config(image="", text="无需验证码")
+        self.refresh_btn.config(state="normal")
 
     def _on_login(self):
         username = self.user_var.get().strip()
         password = self.pass_var.get().strip()
+        captcha_text = self.captcha_var.get().strip()
         if not username or not password:
             messagebox.showwarning("提示", "请输入学号和密码")
+            return
+        if self.login_context is None:
+            messagebox.showwarning("提示", "验证码尚未加载完成，请稍后重试")
+            return
+        if self.login_context.get("need_login", True) and (not captcha_text or not self.captcha_token):
+            messagebox.showwarning("提示", "请输入验证码")
             return
 
         self.login_btn.config(state="disabled")
         self.user_entry.config(state="disabled")
         self.pass_entry.config(state="disabled")
+        self.captcha_entry.config(state="disabled")
+        self.refresh_btn.config(state="disabled")
         threading.Thread(
-            target=self._worker, args=(username, password), daemon=True
+            target=self._worker, args=(username, password, captcha_text), daemon=True
         ).start()
 
     def _set_status(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
 
-    def _worker(self, username, password):
+    def _worker(self, username, password, captcha_text):
         try:
-            session = create_session()
-            cas_login(session, username, password, on_status=self._set_status)
+            session = self.session or create_session()
+            cas_login(
+                session,
+                username,
+                password,
+                captcha_text,
+                self.captcha_token,
+                self.login_context,
+                on_status=self._set_status,
+            )
             data = fetch_all_data(session, on_status=self._set_status)
             self._set_status("加载完成")
             self.root.after(0, lambda: self._show_results(*data))
-        except (ValueError, TimeoutError, RuntimeError) as e:
+        except (ValueError, RuntimeError) as e:
             self._set_status(str(e))
             self.root.after(0, self._unlock_login)
+            self.root.after(0, self._refresh_captcha)
         except Exception as e:
             self._set_status(f"错误: {e}")
             self.root.after(0, self._unlock_login)
+            self.root.after(0, self._refresh_captcha)
 
     def _unlock_login(self):
         self.login_btn.config(state="normal")
         self.user_entry.config(state="normal")
         self.pass_entry.config(state="normal")
+        self.captcha_entry.config(state="normal")
+        self.refresh_btn.config(state="normal")
 
     # -------------------- 结果界面 --------------------
     def _show_results(self, grades, schedule, semester):
@@ -743,10 +834,23 @@ class CreditStatsApp:
 
         tree.tag_configure("odd", background="#F5F5F5")
 
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        table_frame = ttk.Frame(frame)
+        table_frame.pack(side="top", fill="both", expand=True)
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+
+        displayed_keys = {
+            "KCM",
+            "KCXZDM_DISPLAY",
+            "XGXKLBDM_DISPLAY",
+            "XF",
+            "SKJS",
+            "YPSJDD",
+        }
+        row_by_item = {}
 
         for idx, c in enumerate(schedule):
             name = c["KCM"]
@@ -760,9 +864,10 @@ class CreditStatsApp:
                 cn = GX_CATEGORY_NAMES.get(cc, "")
                 cat = f"{cc}（{cn}）" if cn else cc
             tag = ("odd",) if idx % 2 else ()
-            tree.insert(
+            item_id = tree.insert(
                 "", "end", values=(name, ctype, cat, xf, teacher, sched), tags=tag
             )
+            row_by_item[item_id] = c
 
         total_xf = sum(float(c["XF"]) for c in schedule)
         ttk.Label(
@@ -770,6 +875,55 @@ class CreditStatsApp:
             text=f"共 {len(schedule)} 门课程，{total_xf:.1f} 学分",
             font=(self.font_family, 10),
         ).pack(pady=6)
+
+        extra_frame = ttk.LabelFrame(frame, text="其余字段（选中课程）", padding=8)
+        extra_frame.pack(fill="both", expand=False, pady=(0, 6), padx=2)
+
+        extra_cols = ("field", "value")
+        extra_tree = ttk.Treeview(extra_frame, columns=extra_cols, show="headings", height=6)
+        extra_tree.heading("field", text="字段")
+        extra_tree.heading("value", text="值")
+        extra_tree.column("field", width=200, anchor="w")
+        extra_tree.column("value", width=700, anchor="w")
+
+        extra_vsb = ttk.Scrollbar(extra_frame, orient="vertical", command=extra_tree.yview)
+        extra_tree.configure(yscrollcommand=extra_vsb.set)
+        extra_tree.pack(side="left", fill="both", expand=True)
+        extra_vsb.pack(side="right", fill="y")
+
+        def _render_extra_fields(_event=None):
+            for item in extra_tree.get_children():
+                extra_tree.delete(item)
+
+            sel = tree.selection()
+            if not sel:
+                extra_tree.insert("", "end", values=("提示", "请选择一门课程查看其余字段"))
+                return
+
+            row = row_by_item.get(sel[0], {})
+            extras = []
+            for k, v in row.items():
+                if k in displayed_keys:
+                    continue
+                if v is None or v == "":
+                    continue
+                extras.append((k, str(v)))
+
+            if not extras:
+                extra_tree.insert("", "end", values=("提示", "该课程无其余字段"))
+                return
+
+            for k, v in sorted(extras, key=lambda x: x[0]):
+                extra_tree.insert("", "end", values=(k, v))
+
+        tree.bind("<<TreeviewSelect>>", _render_extra_fields)
+
+        first_items = tree.get_children()
+        if first_items:
+            tree.selection_set(first_items[0])
+            _render_extra_fields()
+        else:
+            extra_tree.insert("", "end", values=("提示", "当前学期无课表数据"))
 
     # ---- Tab 4: 毕业要求配置 ----
     def _tab_requirements(self, nb):
