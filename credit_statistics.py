@@ -6,6 +6,8 @@
 
 import re
 import sys
+import io
+import base64
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -13,6 +15,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from collections import defaultdict
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
 
 # 高DPI适配（必须在创建Tk之前调用）
 if sys.platform == "win32":
@@ -139,7 +147,12 @@ def fetch_captcha(session):
         timeout=15,
     )
     data = resp.json()
-    return data["token"], data["img"].replace("\n", "")
+    token = data.get("token", "")
+    img_b64 = data.get("img", "").replace("\n", "")
+    # 兼容 data:image/png;base64,xxxxx 这类返回格式
+    if img_b64.startswith("data:") and "," in img_b64:
+        img_b64 = img_b64.split(",", 1)[1]
+    return token, img_b64
 
 
 def cas_login(
@@ -507,6 +520,8 @@ class CreditStatsApp:
                 return
 
             token, image_b64 = fetch_captcha(self.session)
+            if not token or not image_b64:
+                raise RuntimeError("验证码数据为空")
             self.root.after(0, lambda: self._update_captcha_ui(token, image_b64))
             self._set_status("验证码已加载，请输入后登录")
         except Exception as e:
@@ -517,7 +532,36 @@ class CreditStatsApp:
         self.captcha_token = token
         self.captcha_var.set("")
         if image_b64:
-            self.captcha_photo = tk.PhotoImage(data=image_b64)
+            img_bytes = None
+            try:
+                img_bytes = base64.b64decode(image_b64)
+            except Exception:
+                img_bytes = None
+
+            try:
+                # Tk 8.6+ 支持 PNG，优先按 PNG 解析
+                self.captcha_photo = tk.PhotoImage(data=image_b64, format="png")
+            except tk.TclError:
+                try:
+                    # 回退到自动格式识别
+                    self.captcha_photo = tk.PhotoImage(data=image_b64)
+                except tk.TclError:
+                    # 再回退到 Pillow，兼容 JPEG/WebP 等 Tk 可能不支持的格式
+                    if Image is not None and ImageTk is not None and img_bytes:
+                        try:
+                            pil_img = Image.open(io.BytesIO(img_bytes))
+                            self.captcha_photo = ImageTk.PhotoImage(pil_img)
+                        except Exception:
+                            self.captcha_photo = None
+                    else:
+                        self.captcha_photo = None
+
+                    if self.captcha_photo is None:
+                        self.captcha_image_label.config(image="", text="验证码图片加载失败")
+                        self._set_status("验证码图片解析失败，请点击“刷新验证码”重试")
+                        self.refresh_btn.config(state="normal")
+                        return
+
             self.captcha_image_label.config(image=self.captcha_photo, text="")
         else:
             self.captcha_photo = None
@@ -808,8 +852,18 @@ class CreditStatsApp:
         frame = ttk.Frame(nb)
         nb.add(frame, text=f" 本学期课表（{semester}）")
 
+        # 使用网格布局固定上下结构，避免pack混用导致的大面积空白
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
         cols = ("name", "type", "cat", "credit", "teacher", "time")
-        tree = ttk.Treeview(frame, columns=cols, show="headings")
+
+        table_frame = ttk.Frame(frame)
+        table_frame.grid(row=0, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        tree = ttk.Treeview(table_frame, columns=cols, show="headings")
 
         headers = {
             "name": "课程名称",
@@ -834,13 +888,10 @@ class CreditStatsApp:
 
         tree.tag_configure("odd", background="#F5F5F5")
 
-        table_frame = ttk.Frame(frame)
-        table_frame.pack(side="top", fill="both", expand=True)
-
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
 
         displayed_keys = {
             "KCM",
@@ -874,10 +925,10 @@ class CreditStatsApp:
             frame,
             text=f"共 {len(schedule)} 门课程，{total_xf:.1f} 学分",
             font=(self.font_family, 10),
-        ).pack(pady=6)
+        ).grid(row=1, column=0, sticky="w", pady=6, padx=2)
 
         extra_frame = ttk.LabelFrame(frame, text="其余字段（选中课程）", padding=8)
-        extra_frame.pack(fill="both", expand=False, pady=(0, 6), padx=2)
+        extra_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6), padx=2)
 
         extra_cols = ("field", "value")
         extra_tree = ttk.Treeview(extra_frame, columns=extra_cols, show="headings", height=6)

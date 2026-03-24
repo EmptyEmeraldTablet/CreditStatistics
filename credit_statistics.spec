@@ -10,6 +10,9 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageTk",
         "requests",
         "urllib3",
         "certifi",
